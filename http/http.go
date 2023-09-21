@@ -1,14 +1,19 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/vvinokurshin/ProxyServerCourseVK/cert"
 	"github.com/vvinokurshin/ProxyServerCourseVK/database"
 	"github.com/vvinokurshin/ProxyServerCourseVK/models"
 	"io"
 	"io/ioutil"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,8 +26,117 @@ const (
 )
 
 func ProxyHttps(w http.ResponseWriter, r *http.Request) error {
-	// TODO
-	panic("not implemented")
+	p, err := cert.CreateMitmProxy("scripts/ca/certs/cert.pem", "scripts/ca/certs/key.pem")
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		fmt.Println(err)
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return err
+	}
+	client_conn, _, err := hijacker.Hijack()
+	if err != nil {
+		fmt.Println(err)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return err
+	}
+
+	if _, err := client_conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n")); err != nil {
+		fmt.Println(err)
+		return err
+	}
+
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+
+	pemCert, pemKey, err := cert.CreateCert([]string{host}, p.CaCert, p.CaKey, 240)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	tlsCert, err := tls.X509KeyPair(pemCert, pemKey)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+
+	tlsConfig := &tls.Config{
+		PreferServerCipherSuites: true,
+		CurvePreferences:         []tls.CurveID{tls.X25519, tls.CurveP256},
+		MinVersion:               tls.VersionTLS13,
+		Certificates:             []tls.Certificate{tlsCert},
+	}
+
+	tlsConn := tls.Server(client_conn, tlsConfig)
+	defer tlsConn.Close()
+
+	connReader := bufio.NewReader(tlsConn)
+	for {
+		newRequest, err := http.ReadRequest(connReader)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		changeRequestToTarget(newRequest, r.Host)
+
+		request := ParseRequest(newRequest)
+		err = database.InsertRequest(request)
+		if err != nil {
+			return err
+		}
+
+		resp, err := http.DefaultClient.Do(newRequest)
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		defer resp.Body.Close()
+
+		response := ParseResponse(resp)
+		response.RequestID = request.RequestID
+
+		if err := resp.Write(tlsConn); err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		err = database.InsertResponse(response)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func addrToUrl(addr string) *url.URL {
+	if !strings.HasPrefix(addr, "https") {
+		addr = "https://" + addr
+	}
+	u, err := url.Parse(addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return u
+}
+
+func changeRequestToTarget(req *http.Request, targetHost string) {
+	targetUrl := addrToUrl(targetHost)
+	targetUrl.Path = req.URL.Path
+	targetUrl.RawQuery = req.URL.RawQuery
+	req.URL = targetUrl
+	req.RequestURI = ""
 }
 
 func ParseRequest(r *http.Request) *models.Request {
@@ -224,7 +338,6 @@ func cmpResponses(r *http.Request, response *models.Response) (bool, error) {
 
 	resp, err := http.DefaultTransport.RoundTrip(r)
 	if err != nil {
-		fmt.Println(err)
 		return false, err
 	}
 
